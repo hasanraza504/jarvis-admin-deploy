@@ -1,0 +1,249 @@
+# Android build — free public-repo runners; produces a signed AAB or APK.
+#
+# The app source lives in a PRIVATE repo. It is cloned into the runner at build
+# time with a READ-ONLY deploy key, built, and destroyed with the runner.
+# Nothing from it is ever committed here, and only the explicitly named artifact
+# paths are uploaded, so the cloned tree cannot leak that way.
+#
+# The native project is generated with `expo prebuild` and compiled with
+# Gradle. The upload keystore is written from secrets into the runner's temp
+# directory for the life of the job and handed to Gradle as injected signing
+# properties, so no keystore ever lives in git.
+#
+# WHERE THE BUILD GOES
+# Actions artifacts on a PUBLIC repo are downloadable by anyone who can see the
+# run, and a signed binary embeds the whole JS bundle. So nothing is published
+# here: the build is pushed to private R2 storage under
+# app-builds/<app>/android/.
+
+name: Build Android
+run-name: "Build Android · ${{ inputs.correlation || 'manual' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        # Sent by the dispatching client on every run. This harness has one
+        # release configuration, so the value is recorded and not otherwise used.
+        description: "Build profile name (recorded only; this harness has one release configuration)"
+        default: production
+      format:
+        description: "Output format"
+        type: choice
+        default: aab
+        options: [aab, apk]
+      ref:
+        description: "Source branch/tag/SHA to build"
+        default: preprod
+      correlation:
+        # Stamped into run-name so the client that dispatched this build can
+        # find it again. workflow_dispatch returns 204 with no body, so without
+        # this the only way to identify the run is "the newest one", which
+        # races whenever two builds start together.
+        description: "Correlation id (set by tools/buildkit; leave blank when dispatching by hand)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SRC: src
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the build harness (this repo)
+        uses: actions/checkout@v4
+
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          # A deploy key is scoped to exactly one repository and is read-only,
+          # so a leak cannot reach any other repo or write anywhere.
+          ssh-key: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+          path: ${{ env.SRC }}
+          persist-credentials: false
+
+      - name: Set IST build metadata
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M-IST')"
+          source_revision="$(git -C "$SRC" rev-parse --short HEAD)"
+          # Play needs a versionCode above every earlier upload. Minutes since
+          # the epoch only grow, whichever runner or re-run produces the build.
+          build_number="$(( $(date -u +%s) / 60 ))"
+          echo "APP_BUILD_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "APP_SOURCE_REVISION=$source_revision" >> "$GITHUB_ENV"
+          echo "APP_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          echo "build $build_number of $source_revision ($stamp), profile input: $PROFILE"
+
+      - uses: actions/setup-node@v4
+        with:
+          # The app pins its Node version, and its .npmrc makes npm refuse any other.
+          node-version-file: ${{ env.SRC }}/.nvmrc
+          cache: npm
+          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools build-tools;36.0.0
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate the native project (expo prebuild)
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform android --clean --no-install
+          # The generated project starts at versionCode 1; stamp this build's.
+          sed -i -E "s/^([[:space:]]*versionCode )[0-9]+$/\1${APP_BUILD_NUMBER}/" android/app/build.gradle
+          grep -E "^[[:space:]]*(versionCode|versionName|applicationId) " android/app/build.gradle
+
+      - name: Write the upload keystore from secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_B64:?ANDROID_KEYSTORE_BASE64 is required}"
+          # Outside the source tree, so no later step can pick it up by accident.
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          chmod 600 "$RUNNER_TEMP/upload.jks"
+          echo "keystore $(stat -c%s "$RUNNER_TEMP/upload.jks") bytes"
+
+      - name: Compile and sign with Gradle
+        working-directory: ${{ env.SRC }}/android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          FORMAT: ${{ inputs.format }}
+          # Expo 56's release dex/native tasks can exhaust Gradle's default
+          # heap when they fan out together on a hosted runner. Give D8 enough
+          # room while limiting concurrency so the runner itself stays stable.
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.workers.max=2"
+          # Native symbols and source maps are not uploaded from this harness.
+          SENTRY_DISABLE_AUTO_UPLOAD: "true"
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is required}"
+          : "${KEY_ALIAS:?ANDROID_KEY_ALIAS is required}"
+          : "${KEY_PASSWORD:?ANDROID_KEY_PASSWORD is required}"
+          if [ "$FORMAT" = apk ]; then
+            task=":app:assembleRelease"; out="app/build/outputs/apk/release/app-release.apk"
+          else
+            task=":app:bundleRelease"; out="app/build/outputs/bundle/release/app-release.aab"
+          fi
+          # The injected signing properties replace the generated project's
+          # debug signing for this build only. Values come from env, so the
+          # command as logged shows only the variable names.
+          ./gradlew "$task" --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/upload.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+          cp "$out" "$RUNNER_TEMP/app.$FORMAT"
+          ls -lh "$RUNNER_TEMP/app.$FORMAT"
+
+      - name: Verify the artifact carries the expected signing key
+        # A build signed with any other key is one Play will reject, and the
+        # mistake only shows up at upload time. Comparing the certificate here
+        # costs a second and turns it into a build failure instead.
+        env:
+          EXPECTED: ${{ vars.EXPECTED_SIGNING_SHA1 }}
+          FORMAT: ${{ inputs.format }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED:-}" ]; then
+            echo "::error::EXPECTED_SIGNING_SHA1 is not set on this repository. Refusing to publish an artifact whose signing identity nobody has declared."
+            exit 1
+          fi
+          if [ "$FORMAT" = apk ]; then
+            # Modern APK v2/v3 signatures are not JAR signatures. Verify the
+            # archive cryptographically before comparing its signing identity.
+            verifier="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+            test -x "$verifier"
+            echo "Verifying APK with $verifier"
+            certificate=$("$verifier" verify --print-certs "$RUNNER_TEMP/app.apk")
+            printf '%s\n' "$certificate"
+            actual=$(printf '%s\n' "$certificate" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ' :\t\r' | tr 'a-f' 'A-F')
+          else
+            actual=$(keytool -printcert -jarfile "$RUNNER_TEMP/app.$FORMAT" \
+                       | grep -m1 'SHA1:' | cut -d: -f2- | tr -d ' :\t\r' | tr 'a-f' 'A-F')
+          fi
+          want=$(printf '%s' "$EXPECTED" | tr -d ' :\t\r' | tr 'a-f' 'A-F')
+          echo "expected  $want"
+          echo "actual    $actual"
+          [[ "$actual" =~ ^[0-9A-F]{40}$ ]] || { echo "::error::Could not parse one SHA-1 signing fingerprint"; exit 1; }
+          [[ "$want" =~ ^[0-9A-F]{40}$ ]] || { echo "::error::Invalid expected signing fingerprint"; exit 1; }
+          if [ "$actual" != "$want" ]; then
+            echo "::error::Signing key mismatch. Play will reject this upload: expected $want, built $actual."
+            exit 1
+          fi
+          echo "signing certificate matches the declared upload key"
+
+      - name: Upload to private storage
+        # The artifact goes to private R2 storage instead of GitHub Actions
+        # artifacts, which on a PUBLIC repo are downloadable by anyone.
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_BUILDS }}
+          EXT: ${{ inputs.format }}
+          SRC_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build."
+            exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
+            echo "::error::rclone install failed"; exit 1; }
+
+          ( cd "$RUNNER_TEMP" && sha256sum "app.${EXT}" > sha256.txt && cat sha256.txt )
+
+          conf="$RUNNER_TEMP/rclone.conf"
+          printf '%s' "$RCLONE_CONF" > "$conf"
+          chmod 600 "$conf"
+
+          # Repo is <app>-deploy; the storage folder is <app>.
+          app="${GITHUB_REPOSITORY##*/}"; app="${app%-deploy}"
+          # Stamp the file so builds are self-describing in the folder listing.
+          name="${app}-android-${APP_BUILD_STAMP}-run${GITHUB_RUN_NUMBER}.${EXT}"
+
+          rclone --config "$conf" copyto "$RUNNER_TEMP/app.${EXT}" \
+            "builds:${app}/android/${name}" --no-traverse
+          rclone --config "$conf" copyto "$RUNNER_TEMP/sha256.txt" \
+            "builds:${app}/android/${name}.sha256" --no-traverse
+          rm -f "$conf"
+
+          {
+            echo "### Build uploaded"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| file | \`${name}\` |"
+            echo "| Private storage | \`app-builds/${app}/android/\` |"
+            echo "| source ref | \`${SRC_REF}\` (\`${APP_SOURCE_REVISION}\`) |"
+            echo "| versionCode | \`${APP_BUILD_NUMBER}\` |"
+            echo "| sha256 | \`$(cut -d" " -f1 "$RUNNER_TEMP/sha256.txt")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "uploaded ${name}"
+
+      - name: Scrub credentials from the runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/rclone.conf" || true

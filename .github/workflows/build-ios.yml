@@ -1,0 +1,333 @@
+# iOS build — free macOS runners on a public repo; produces a signed IPA.
+#
+# Same shape as the Android job: the PRIVATE source repo is cloned into the
+# runner with a READ-ONLY deploy key, built, and destroyed with the runner.
+#
+# The native project is generated with `expo prebuild`, then archived and
+# exported with xcodebuild. The distribution certificate goes into a temporary
+# keychain and the provisioning profile into the runner's profile folder, both
+# from secrets and both removed at the end. The .p12 is never written to the
+# repo and never printed.
+#
+# WHERE THE BUILD GOES
+# Actions artifacts on a PUBLIC repo are downloadable by anyone who can see the
+# run, and an IPA embeds the whole JS bundle. So nothing is published here: the
+# build is pushed to private R2 storage under app-builds/<app>/ios/.
+#
+# NOTE: an IPA signed for App Store distribution will NOT install directly on a
+# device; it goes to TestFlight.
+
+name: Build iOS
+run-name: "Build iOS · ${{ inputs.correlation || 'manual' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        # Sent by the dispatching client on every run. This harness has one
+        # release configuration, so the value is recorded and not otherwise used.
+        description: "Build profile name (recorded only; this harness has one release configuration)"
+        default: production
+      ref:
+        description: "Source branch/tag/SHA to build"
+        default: preprod
+      correlation:
+        # Stamped into run-name so the client that dispatched this build can
+        # find it again. workflow_dispatch returns 204 with no body, so without
+        # this the only way to identify the run is "the newest one", which
+        # races whenever two builds start together.
+        description: "Correlation id (set by tools/buildkit; leave blank when dispatching by hand)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SRC: src
+  # SDK 56 turns on Expo's precompiled xcframeworks by default, and their
+  # from-source fallback for ExpoModulesJSI needs SwiftPM resolution that fails
+  # in the archive phase ("Could not resolve package dependencies").
+  # precompiled_modules.rb enables the feature only when this is exactly "1",
+  # so "0" builds every module from source, which is the path known to work.
+  EXPO_USE_PRECOMPILED_MODULES: "0"
+  # Native symbols and source maps are not uploaded from this harness.
+  SENTRY_DISABLE_AUTO_UPLOAD: "true"
+
+jobs:
+  build:
+    # Standard macOS runners are free for PUBLIC repositories — this is the
+    # whole reason the harness lives in a separate public repo.
+    #
+    # macos-26 (Xcode 26 / Swift 6.3): expo-modules-jsi on SDK 56 ships a
+    # Package.swift declaring swift-tools-version 6.2, which older Xcodes
+    # cannot parse.
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out the build harness (this repo)
+        uses: actions/checkout@v4
+
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          # A deploy key is scoped to exactly one repository and is read-only,
+          # so a leak cannot reach any other repo or write anywhere.
+          ssh-key: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+          path: ${{ env.SRC }}
+          persist-credentials: false
+
+      - name: Set IST build metadata
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M-IST')"
+          source_revision="$(git -C "$SRC" rev-parse --short HEAD)"
+          # App Store Connect needs a CFBundleVersion above every earlier upload
+          # of the same version. Minutes since the epoch only grow.
+          build_number="$(( $(date -u +%s) / 60 ))"
+          echo "APP_BUILD_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "APP_SOURCE_REVISION=$source_revision" >> "$GITHUB_ENV"
+          echo "APP_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          echo "build $build_number of $source_revision ($stamp), profile input: $PROFILE"
+
+      - uses: actions/setup-node@v4
+        with:
+          # The app pins its Node version, and its .npmrc makes npm refuse any other.
+          node-version-file: ${{ env.SRC }}/.nvmrc
+          cache: npm
+          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+
+      - name: Select the newest Xcode and report Swift
+        # Pick the highest installed version explicitly and print the Swift
+        # version, so a tools-version mismatch is obvious in the log instead of
+        # surfacing as "Could not resolve package dependencies".
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          newest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          newest=${newest:-/Applications/Xcode.app}
+          sudo xcode-select -s "$newest"
+          echo "selected: $newest"
+          xcodebuild -version
+          swift --version
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate the native project (expo prebuild, pod install)
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform ios --clean --no-install
+          ( cd ios && pod install )
+
+      - name: Install the signing certificate and profile from secrets
+        env:
+          CERT_B64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          : "${CERT_B64:?IOS_DIST_CERT_P12_BASE64 is required}"
+          : "${CERT_PASSWORD:?IOS_DIST_CERT_PASSWORD is required}"
+          : "${PROFILE_B64:?IOS_PROVISIONING_PROFILE_BASE64 is required}"
+          printf '%s' "$CERT_B64" | base64 -D > "$RUNNER_TEMP/dist-cert.p12"
+          printf '%s' "$PROFILE_B64" | base64 -D > "$RUNNER_TEMP/profile.mobileprovision"
+
+          # A throwaway keychain, unlocked for this job only and added to the
+          # search list so codesign finds the identity.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/dist-cert.p12" -k "$keychain" -f pkcs12 -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/dist-cert.p12"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$keychain" | sed -E 's/^ *[0-9]+\) [0-9A-F]{40} //'
+
+          # The profile names the team, the bundle id and itself; read them
+          # from it instead of repeating them here.
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          uuid=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          team=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")
+          app_id=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$RUNNER_TEMP/profile.mobileprovision" "$dir/$uuid.mobileprovision"
+          done
+          {
+            echo "PROFILE_UUID=$uuid"
+            echo "PROFILE_NAME=$name"
+            echo "TEAM_ID=$team"
+            echo "BUNDLE_ID=${app_id#"$team".}"
+          } >> "$GITHUB_ENV"
+          echo "profile \"$name\" for $app_id"
+
+      - name: Point the app target at the profile and stamp the build number
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          # Manual signing on the app target only; CocoaPods targets keep
+          # their own settings. This is Expo's own helper for exactly this.
+          node -e '
+            const { IOSConfig } = require("expo/config-plugins");
+            IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj(process.cwd(), {
+              profileName: process.env.PROFILE_NAME,
+              appleTeamId: process.env.TEAM_ID,
+              buildConfiguration: "Release",
+            });
+          '
+          workspace=$(ls -d ios/*.xcworkspace | head -1)
+          scheme=$(basename "$workspace" .xcworkspace)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUILD_NUMBER" "ios/$scheme/Info.plist"
+          echo "IOS_WORKSPACE=$workspace" >> "$GITHUB_ENV"
+          echo "IOS_SCHEME=$scheme" >> "$GITHUB_ENV"
+          echo "$scheme: CFBundleShortVersionString $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "ios/$scheme/Info.plist"), CFBundleVersion $APP_BUILD_NUMBER"
+
+      - name: Compile the archive with xcodebuild
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive -quiet \
+            -workspace "$IOS_WORKSPACE" \
+            -scheme "$IOS_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN"
+
+      - name: Export the IPA
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingCertificate</key><string>iPhone Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string></dict>
+            <key>destination</key><string>export</string>
+            <key>uploadSymbols</key><false/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          ipa=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          mv "$ipa" "$RUNNER_TEMP/app.ipa"
+          ls -lh "$RUNNER_TEMP/app.ipa"
+
+      - name: Verify the archive carries the expected signing identity
+        # The embedded profile must be for this app and this team, and the
+        # certificate must be the one whose private key this repo was given.
+        env:
+          EXPECTED_APP_ID: ${{ vars.EXPECTED_IOS_APP_ID }}
+          EXPECTED_CERT_SERIAL: ${{ vars.EXPECTED_IOS_CERT_SERIAL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_APP_ID:-}" ] || [ -z "${EXPECTED_CERT_SERIAL:-}" ]; then
+            echo "::error::EXPECTED_IOS_APP_ID / EXPECTED_IOS_CERT_SERIAL are not set on this repository. Refusing to publish an archive whose signing identity nobody has declared."
+            exit 1
+          fi
+          work="$RUNNER_TEMP/verify"; rm -rf "$work"; mkdir -p "$work"
+          unzip -o -q "$RUNNER_TEMP/app.ipa" 'Payload/*/embedded.mobileprovision' -d "$work"
+          prov=$(find "$work" -name embedded.mobileprovision | head -1)
+          if [ -z "$prov" ]; then
+            echo "::error::no embedded.mobileprovision in the archive - it is not signed for distribution."
+            exit 1
+          fi
+          identity=$(openssl smime -inform der -verify -noverify -in "$prov" 2>/dev/null \
+            | python3 -c "import plistlib,subprocess,sys; p=plistlib.loads(sys.stdin.buffer.read()); c=p['DeveloperCertificates'][0]; s=subprocess.run(['openssl','x509','-inform','der','-noout','-serial'],input=c,capture_output=True).stdout.decode().split('=')[1].strip(); print(p['Entitlements']['application-identifier'], s)")
+          app_id="${identity%% *}"
+          serial="${identity##* }"
+          echo "expected  $EXPECTED_APP_ID  $EXPECTED_CERT_SERIAL"
+          echo "actual    $app_id  $serial"
+          if [ "$app_id" != "$EXPECTED_APP_ID" ]; then
+            echo "::error::Provisioning profile is for $app_id, not $EXPECTED_APP_ID - this archive would go to the wrong App Store record."
+            exit 1
+          fi
+          if [ "$serial" != "$EXPECTED_CERT_SERIAL" ]; then
+            echo "::error::Signed with certificate $serial, expected $EXPECTED_CERT_SERIAL."
+            exit 1
+          fi
+          echo "signing identity matches the certificate and profile Apple knows"
+
+      - name: Upload to private storage
+        # The artifact goes to private R2 storage instead of GitHub Actions
+        # artifacts, which on a PUBLIC repo are downloadable by anyone.
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_BUILDS }}
+          EXT: ipa
+          SRC_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build."
+            exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
+            echo "::error::rclone install failed"; exit 1; }
+
+          ( cd "$RUNNER_TEMP" && shasum -a 256 "app.${EXT}" > sha256.txt && cat sha256.txt )
+
+          conf="$RUNNER_TEMP/rclone.conf"
+          printf '%s' "$RCLONE_CONF" > "$conf"
+          chmod 600 "$conf"
+
+          # Repo is <app>-deploy; the storage folder is <app>.
+          app="${GITHUB_REPOSITORY##*/}"; app="${app%-deploy}"
+          # Stamp the file so builds are self-describing in the folder listing.
+          name="${app}-ios-${APP_BUILD_STAMP}-run${GITHUB_RUN_NUMBER}.${EXT}"
+
+          rclone --config "$conf" copyto "$RUNNER_TEMP/app.${EXT}" \
+            "builds:${app}/ios/${name}" --no-traverse
+          rclone --config "$conf" copyto "$RUNNER_TEMP/sha256.txt" \
+            "builds:${app}/ios/${name}.sha256" --no-traverse
+          rm -f "$conf"
+
+          {
+            echo "### Build uploaded"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| file | \`${name}\` |"
+            echo "| Private storage | \`app-builds/${app}/ios/\` |"
+            echo "| source ref | \`${SRC_REF}\` (\`${APP_SOURCE_REVISION}\`) |"
+            echo "| CFBundleVersion | \`${APP_BUILD_NUMBER}\` |"
+            echo "| sha256 | \`$(cut -d" " -f1 "$RUNNER_TEMP/sha256.txt")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "uploaded ${name}"
+
+      - name: Scrub credentials from the runner
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then security delete-keychain "$SIGNING_KEYCHAIN" || true; fi
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision" \
+                  "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision" || true
+          fi
+          rm -f "$RUNNER_TEMP/dist-cert.p12" "$RUNNER_TEMP/profile.mobileprovision" \
+                "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/rclone.conf" || true
