@@ -15,6 +15,13 @@
 # run, and a signed binary embeds the whole JS bundle. So nothing is published
 # here: the build is pushed to private R2 storage under
 # app-builds/<app>/android/.
+#
+# WHAT THE PUBLIC LOG SHOWS
+# This repo's logs are public. Every tool that runs the private tree (npm,
+# expo prebuild, Gradle, CocoaPods, xcodebuild) runs under
+# .github/scripts/quiet_run.py: its full output goes to a private file under
+# $RUNNER_TEMP, deleted by the scrub step, and the log shows only allowlisted
+# progress and result lines, plus a filtered error block on failure.
 
 name: Build Android
 run-name: "Build Android · ${{ inputs.correlation || 'manual' }}"
@@ -52,14 +59,50 @@ concurrency:
 
 env:
   SRC: src
+  QUIET_RUN: ${{ github.workspace }}/.github/scripts/quiet_run.py
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: Require the storage secret
+        # First, before anything is cloned or built: a build with nowhere
+        # private to go is a wasted runner. See SECRETS.md, "The R2 remote".
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_BUILDS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::The Actions secret RCLONE_CONFIG_BUILDS is not set on this repository. It must be an rclone config whose [builds] remote reaches the app-builds bucket only, made with an R2 API token limited to that bucket. See SECRETS.md, section 'The R2 remote'."
+            exit 1
+          fi
+          if ! printf '%s\n' "$RCLONE_CONF" | grep -qx '\[builds\]'; then
+            echo "::error::RCLONE_CONFIG_BUILDS has no [builds] remote. See SECRETS.md, section 'The R2 remote'."
+            exit 1
+          fi
+          echo "storage secret present"
+
       - name: Check out the build harness (this repo)
         uses: actions/checkout@v4
+
+      - name: Install rclone (pinned, checksum-verified)
+        # Its own step, with no secret in its environment, and nothing from the
+        # download runs until it matches the pinned sha256.
+        # (Not RCLONE_*: rclone reads every RCLONE_* variable as a flag.)
+        env:
+          PINNED_VERSION: v1.75.2
+          PINNED_SHA256: 349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/rclone"; mkdir -p "$dir/bin"
+          zip="rclone-${PINNED_VERSION}-linux-amd64.zip"
+          curl -fsSL --retry 3 -o "$dir/$zip" "https://github.com/rclone/rclone/releases/download/${PINNED_VERSION}/${zip}"
+          echo "${PINNED_SHA256}  $dir/$zip" | sha256sum -c -
+          unzip -q -j -o "$dir/$zip" "*/rclone" -d "$dir/bin"
+          chmod 755 "$dir/bin/rclone"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/rclone" version | head -1
 
       - name: Check out app source (private, read-only deploy key)
         uses: actions/checkout@v4
@@ -105,16 +148,18 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.SRC }}
-        run: npm ci --no-audit --no-fund
+        run: python3 "$QUIET_RUN" npm-ci -- npm ci --no-audit --no-fund
 
       - name: Generate the native project (expo prebuild)
         working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          npx expo prebuild --platform android --clean --no-install
+          python3 "$QUIET_RUN" expo-prebuild -- npx expo prebuild --platform android --clean --no-install
           # The generated project starts at versionCode 1; stamp this build's.
           sed -i -E "s/^([[:space:]]*versionCode )[0-9]+$/\1${APP_BUILD_NUMBER}/" android/app/build.gradle
-          grep -E "^[[:space:]]*(versionCode|versionName|applicationId) " android/app/build.gradle
+          grep -qE "^[[:space:]]*versionCode ${APP_BUILD_NUMBER}$" android/app/build.gradle \
+            || { echo "::error::could not stamp versionCode into android/app/build.gradle"; exit 1; }
+          echo "versionCode ${APP_BUILD_NUMBER}"
 
       - name: Write the upload keystore from secrets
         env:
@@ -131,7 +176,9 @@ jobs:
         working-directory: ${{ env.SRC }}/android
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          # The alias is not sensitive, so it is a variable: as a secret,
+          # GitHub would mask that word everywhere in the public log.
+          KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           FORMAT: ${{ inputs.format }}
           # Expo 56's release dex/native tasks can exhaust Gradle's default
@@ -143,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is required}"
-          : "${KEY_ALIAS:?ANDROID_KEY_ALIAS is required}"
+          : "${KEY_ALIAS:?the ANDROID_KEY_ALIAS variable is required}"
           : "${KEY_PASSWORD:?ANDROID_KEY_PASSWORD is required}"
           if [ "$FORMAT" = apk ]; then
             task=":app:assembleRelease"; out="app/build/outputs/apk/release/app-release.apk"
@@ -153,7 +200,9 @@ jobs:
           # The injected signing properties replace the generated project's
           # debug signing for this build only. Values come from env, so the
           # command as logged shows only the variable names.
-          ./gradlew "$task" --no-daemon \
+          # Gradle's output (task output includes the resolved app config, e.g.
+          # the expo-updates fingerprint) stays in the private log.
+          python3 "$QUIET_RUN" gradle -- ./gradlew "$task" --no-daemon --console=plain \
             -Pandroid.injected.signing.store.file="$RUNNER_TEMP/upload.jks" \
             -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
@@ -208,11 +257,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${RCLONE_CONF:-}" ]; then
-            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build."
+            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build. See SECRETS.md."
             exit 1
           fi
-          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
-            echo "::error::rclone install failed"; exit 1; }
+          # rclone was installed, pinned and verified, by an earlier step.
+          command -v rclone >/dev/null || { echo "::error::rclone is not installed"; exit 1; }
 
           ( cd "$RUNNER_TEMP" && sha256sum "app.${EXT}" > sha256.txt && cat sha256.txt )
 
@@ -246,4 +295,4 @@ jobs:
 
       - name: Scrub credentials from the runner
         if: always()
-        run: rm -f "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/rclone.conf" || true
+        run: rm -rf "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/rclone.conf" "$RUNNER_TEMP/private-logs" || true

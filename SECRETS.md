@@ -22,6 +22,7 @@ gh secret set NAME -R <this repo> < file
 | `EXPECTED_SIGNING_SHA1` | SHA-1 of the Android upload certificate (`keytool -list -v`) |
 | `EXPECTED_IOS_APP_ID` | `<team id>.<bundle id>` of the provisioning profile |
 | `EXPECTED_IOS_CERT_SERIAL` | Serial number of the distribution certificate |
+| `ANDROID_KEY_ALIAS` | Key alias inside the upload keystore (not sensitive, so not a secret: a secret's value is masked everywhere in the log, and a common word like an alias would blank out unrelated log text) |
 
 The three `EXPECTED_*` values are what the build compares the signed binary
 against; a build signed with anything else fails instead of being uploaded.
@@ -33,7 +34,7 @@ against; a build signed with anything else fails instead of being uploaded.
 | Name | What it is |
 |---|---|
 | `SOURCE_REPO_SSH_KEY` | Private half of a **read-only deploy key** on `InstaFarms/jarvis-admin` |
-| `RCLONE_CONFIG_BUILDS` | An rclone config whose `[builds]` remote is pinned to the R2 `app-builds` bucket |
+| `RCLONE_CONFIG_BUILDS` | An rclone config whose `[builds]` remote reaches the R2 `app-builds` bucket, made with an R2 API token **limited to that bucket** (see below). Both workflows check for it in their first step and stop there if it is missing. |
 
 ### `android` branch
 
@@ -41,7 +42,6 @@ against; a build signed with anything else fails instead of being uploaded.
 |---|---|
 | `ANDROID_KEYSTORE_BASE64` | `base64 -w0 upload.jks` |
 | `ANDROID_KEYSTORE_PASSWORD` | Keystore password |
-| `ANDROID_KEY_ALIAS` | Key alias inside the keystore |
 | `ANDROID_KEY_PASSWORD` | Key password (the keystore password, for a PKCS12 keystore) |
 
 ### `ios` branch
@@ -80,11 +80,88 @@ regenerate the profile and set `IOS_PROVISIONING_PROFILE_BASE64` again.
 Cloudflare R2, and a `[builds]` alias remote pointing at the `app-builds`
 bucket, so the workflow only ever names `builds:<app>/<platform>/…`.
 
-Be aware of what that does and does not buy you: the alias constrains **this
-client**, not the credential. Unless the R2 API token itself is scoped to the
-`app-builds` bucket, anyone holding it could point a different config at other
-buckets. It is defence in depth, not a permission boundary — prefer a
-bucket-scoped token, keep the secret tight and rotate it if in doubt.
+**The credential in it must be an R2 API token limited to the `app-builds`
+bucket.** The alias constrains only the rclone client; the token is what
+GitHub hands to every step that has the secret in its environment, so the
+token itself must be unable to reach any other bucket. An account-wide R2
+key must never be used here.
+
+1. Cloudflare dashboard → R2 → **Manage API tokens** → **Create API token**:
+   permission **Object Read & Write**, **Apply to specific buckets only** →
+   `app-builds`, no IP filter needed, TTL as you prefer. Keep the page open:
+   it shows the access key id and secret access key once.
+2. Write the config in a private temporary directory, using an editor so the
+   keys never appear in shell history:
+
+   ```bash
+   umask 077
+   d=$(mktemp -d) && chmod 700 "$d"
+   cat > "$d/rclone.conf" <<'EOF'
+   [r2]
+   type = s3
+   provider = Cloudflare
+   access_key_id = PASTE_ACCESS_KEY_ID
+   secret_access_key = PASTE_SECRET_ACCESS_KEY
+   endpoint = https://<account id>.r2.cloudflarestorage.com
+   no_check_bucket = true
+
+   [builds]
+   type = alias
+   remote = r2:app-builds
+   EOF
+   ${EDITOR:-vi} "$d/rclone.conf"      # replace the two PASTE_ values and the account id
+   ```
+
+   `no_check_bucket = true` is required: a bucket-scoped token may not list
+   or create buckets.
+3. Prove the scope before setting it. The first command must list the
+   `app-builds` folders. The second must either fail with an access error or
+   list `app-builds` alone; if it lists any other bucket, the token is not
+   bucket-scoped, so do not use it:
+
+   ```bash
+   rclone --config "$d/rclone.conf" lsf builds: --dirs-only
+   rclone --config "$d/rclone.conf" lsd r2:
+   ```
+
+4. Set the secret from the file, check it by name, and delete the file:
+
+   ```bash
+   gh secret set RCLONE_CONFIG_BUILDS -R <this repo> < "$d/rclone.conf"
+   gh secret list -R <this repo>
+   rm -rf "$d"
+   ```
+
+Rotate by creating a new token, repeating these steps and then deleting the
+old token in the Cloudflare dashboard.
+
+rclone itself is installed by its own workflow step, at a pinned version whose
+archive must match a pinned sha256, and that step has no secret in its
+environment.
+
+## What the public log shows
+
+Workflow logs on a public repository are public. The private tree is never
+committed here, and its tools' output is kept out of the log:
+
+- `npm ci`, `expo prebuild`, `pod install`, the profile helper, Gradle and
+  `xcodebuild` run under `.github/scripts/quiet_run.py`. Their full output
+  goes to a mode-600 file under `$RUNNER_TEMP/private-logs/`, which is never
+  uploaded as an artifact or cache and is deleted by the scrub step.
+- The log shows only allowlisted lines: Gradle `:app:` task names, the
+  `npm ci`, prebuild, CocoaPods and xcodebuild result lines, and timings.
+- On failure it shows a filtered error block: error lines and the last lines
+  of output, minus anything JSON-shaped, longer than 300 characters,
+  base64-shaped, an environment listing, a code frame, a note or warning, or
+  credential-shaped. Paths into the private tree outside `node_modules/`,
+  `ios/` and `android/` are replaced with `<src>/<app file>`.
+
+What the log does still show: the source repository's name, the ref and
+commit SHA built, and that commit's subject line (printed by
+`actions/checkout`); the app's version and build number; the signing
+certificate's name and the profile's name and app id; the expected and actual
+signing fingerprints; and the artifact's file name and sha256. Nothing else
+from the private tree is printed by the harness's own steps.
 
 ## The deploy key
 

@@ -26,6 +26,15 @@ builds at no cost.
 Nothing from the source tree is committed here, and the job only uploads the
 artifact paths it names explicitly.
 
+The logs are public, so the source tree's tools (npm, expo prebuild, Gradle,
+CocoaPods, xcodebuild) run under `.github/scripts/quiet_run.py`. Their full
+output stays in a private file on the runner, deleted at the end of the job;
+the log shows only allowlisted progress and result lines, and a filtered error
+block on failure. The log does still show the source repository's name, the
+commit SHA and subject that was built, the app version and build number, the
+signing identity names and fingerprints, and the artifact's name and sha256.
+[`SECRETS.md`](SECRETS.md) lists exactly what is kept out and what is not.
+
 ## Branches
 
 | Branch | Workflow | Runner | Produces |
@@ -85,3 +94,8 @@ each value.
 - Keep `permissions: contents: read`.
 - Workflow **logs are public**. Never `echo` a secret; pass values via `env:`
   rather than inline `${{ }}` interpolation inside a shell command.
+- Any new step that runs the source tree's tooling must run it under
+  `quiet_run.py`. Do not print file contents, the resolved app config, an
+  environment listing or `package.json` fields.
+- No `curl … | sh` installers. A tool is downloaded at a pinned version,
+  checked against a pinned sha256, in a step with no secret in its environment.

@@ -16,6 +16,13 @@
 #
 # NOTE: an IPA signed for App Store distribution will NOT install directly on a
 # device; it goes to TestFlight.
+#
+# WHAT THE PUBLIC LOG SHOWS
+# This repo's logs are public. Every tool that runs the private tree (npm,
+# expo prebuild, CocoaPods, the profile helper, xcodebuild) runs under
+# .github/scripts/quiet_run.py: its full output goes to a private file under
+# $RUNNER_TEMP, deleted by the scrub step, and the log shows only allowlisted
+# progress and result lines, plus a filtered error block on failure.
 
 name: Build iOS
 run-name: "Build iOS · ${{ inputs.correlation || 'manual' }}"
@@ -48,6 +55,7 @@ concurrency:
 
 env:
   SRC: src
+  QUIET_RUN: ${{ github.workspace }}/.github/scripts/quiet_run.py
   # SDK 56 turns on Expo's precompiled xcframeworks by default, and their
   # from-source fallback for ExpoModulesJSI needs SwiftPM resolution that fails
   # in the archive phase ("Could not resolve package dependencies").
@@ -68,8 +76,43 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 120
     steps:
+      - name: Require the storage secret
+        # First, before anything is cloned or built: a build with nowhere
+        # private to go is a wasted runner. See SECRETS.md, "The R2 remote".
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_BUILDS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::The Actions secret RCLONE_CONFIG_BUILDS is not set on this repository. It must be an rclone config whose [builds] remote reaches the app-builds bucket only, made with an R2 API token limited to that bucket. See SECRETS.md, section 'The R2 remote'."
+            exit 1
+          fi
+          if ! printf '%s\n' "$RCLONE_CONF" | grep -qx '\[builds\]'; then
+            echo "::error::RCLONE_CONFIG_BUILDS has no [builds] remote. See SECRETS.md, section 'The R2 remote'."
+            exit 1
+          fi
+          echo "storage secret present"
+
       - name: Check out the build harness (this repo)
         uses: actions/checkout@v4
+
+      - name: Install rclone (pinned, checksum-verified)
+        # Its own step, with no secret in its environment, and nothing from the
+        # download runs until it matches the pinned sha256.
+        # (Not RCLONE_*: rclone reads every RCLONE_* variable as a flag.)
+        env:
+          PINNED_VERSION: v1.75.2
+          PINNED_SHA256: 610ab7d48615135dfc60b763858b11a426a0d3d1160c1bb76fb0ae6011b02edd
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/rclone"; mkdir -p "$dir/bin"
+          zip="rclone-${PINNED_VERSION}-osx-arm64.zip"
+          curl -fsSL --retry 3 -o "$dir/$zip" "https://github.com/rclone/rclone/releases/download/${PINNED_VERSION}/${zip}"
+          echo "${PINNED_SHA256}  $dir/$zip" | shasum -a 256 -c -
+          unzip -q -j -o "$dir/$zip" "*/rclone" -d "$dir/bin"
+          chmod 755 "$dir/bin/rclone"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/rclone" version | head -1
 
       - name: Check out app source (private, read-only deploy key)
         uses: actions/checkout@v4
@@ -120,14 +163,14 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.SRC }}
-        run: npm ci --no-audit --no-fund
+        run: python3 "$QUIET_RUN" npm-ci -- npm ci --no-audit --no-fund
 
       - name: Generate the native project (expo prebuild, pod install)
         working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          npx expo prebuild --platform ios --clean --no-install
-          ( cd ios && pod install )
+          python3 "$QUIET_RUN" expo-prebuild -- npx expo prebuild --platform ios --clean --no-install
+          ( cd ios && python3 "$QUIET_RUN" pod-install -- pod install )
 
       - name: Install the signing certificate and profile from secrets
         env:
@@ -184,7 +227,7 @@ jobs:
           set -euo pipefail
           # Manual signing on the app target only; CocoaPods targets keep
           # their own settings. This is Expo's own helper for exactly this.
-          node -e '
+          python3 "$QUIET_RUN" set-profile -- node -e '
             const { IOSConfig } = require("expo/config-plugins");
             IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj(process.cwd(), {
               profileName: process.env.PROFILE_NAME,
@@ -203,7 +246,9 @@ jobs:
         working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          xcodebuild archive -quiet \
+          # The archive runs the app's script phases (expo-updates prints the
+          # resolved config as its fingerprint); that stays in the private log.
+          python3 "$QUIET_RUN" xcodebuild-archive -- xcodebuild archive -quiet \
             -workspace "$IOS_WORKSPACE" \
             -scheme "$IOS_SCHEME" \
             -configuration Release \
@@ -232,7 +277,7 @@ jobs:
           </plist>
           PLIST
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
-          xcodebuild -exportArchive \
+          python3 "$QUIET_RUN" xcodebuild-export -- xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
@@ -285,11 +330,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${RCLONE_CONF:-}" ]; then
-            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build."
+            echo "::error::RCLONE_CONFIG_BUILDS is unset — refusing to finish with nowhere to put the build. See SECRETS.md."
             exit 1
           fi
-          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
-            echo "::error::rclone install failed"; exit 1; }
+          # rclone was installed, pinned and verified, by an earlier step.
+          command -v rclone >/dev/null || { echo "::error::rclone is not installed"; exit 1; }
 
           ( cd "$RUNNER_TEMP" && shasum -a 256 "app.${EXT}" > sha256.txt && cat sha256.txt )
 
@@ -331,3 +376,4 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP/dist-cert.p12" "$RUNNER_TEMP/profile.mobileprovision" \
                 "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/rclone.conf" || true
+          rm -rf "$RUNNER_TEMP/private-logs" || true
