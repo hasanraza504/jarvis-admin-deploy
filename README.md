@@ -28,12 +28,22 @@ artifact paths it names explicitly.
 
 The logs are public, so the source tree's tools (npm, expo prebuild, Gradle,
 CocoaPods, xcodebuild) run under `.github/scripts/quiet_run.py`. Their full
-output stays in a private file on the runner, deleted at the end of the job;
-the log shows only allowlisted progress and result lines, and a filtered error
-block on failure. The log does still show the source repository's name, the
-commit SHA and subject that was built, the app version and build number, the
-signing identity names and fingerprints, and the artifact's name and sha256.
-[`SECRETS.md`](SECRETS.md) lists exactly what is kept out and what is not.
+output stays in a private file on the runner, deleted at the end of the job.
+While they run, the log shows only allowlisted progress and result lines. If
+one fails, the log shows a short block of fixed error templates: the failed
+Gradle task or xcodebuild phase, the language and kind of file a compiler error
+is in, the npm error code, a standard error class, and the exit status. It
+never shows the tool's message text, paths or source lines. To see the full
+error, rerun the build privately. Everything the wrapper prints is fenced with
+`::stop-commands::`, so it cannot act as a workflow command, and no step saves
+an Actions cache.
+
+What the log still shows from the private tree is the source repository's
+name, the ref, commit SHA and subject that was built, the Node version in its
+`.nvmrc`, the app version and build number, and on iOS the scheme and workspace
+name. It also shows signing names and fingerprints, which come from this
+repo's secrets, and the artifact's name and sha256.
+[`SECRETS.md`](SECRETS.md) lists exactly what can appear.
 
 ## Branches
 
@@ -99,3 +109,9 @@ each value.
   environment listing or `package.json` fields.
 - No `curl … | sh` installers. A tool is downloaded at a pinned version,
   checked against a pinned sha256, in a step with no secret in its environment.
+- Do not add an Actions cache (`cache:` on a setup action, or `actions/cache`).
+  Any run of this public repository can restore one, and a cache of npm,
+  CocoaPods or Gradle directories names the private tree's dependencies.
+- A new failure shape for `quiet_run.py` is a fixed template with bounded
+  parts, never the tool's message text. Add a synthetic case for it to the
+  filter test before relying on it.

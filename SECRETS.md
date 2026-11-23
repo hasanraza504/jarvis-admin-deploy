@@ -142,26 +142,74 @@ environment.
 ## What the public log shows
 
 Workflow logs on a public repository are public. The private tree is never
-committed here, and its tools' output is kept out of the log:
+committed here, and its tools' output is kept out of the log.
 
-- `npm ci`, `expo prebuild`, `pod install`, the profile helper, Gradle and
-  `xcodebuild` run under `.github/scripts/quiet_run.py`. Their full output
-  goes to a mode-600 file under `$RUNNER_TEMP/private-logs/`, which is never
-  uploaded as an artifact or cache and is deleted by the scrub step.
-- The log shows only allowlisted lines: Gradle `:app:` task names, the
-  `npm ci`, prebuild, CocoaPods and xcodebuild result lines, and timings.
-- On failure it shows a filtered error block: error lines and the last lines
-  of output, minus anything JSON-shaped, longer than 300 characters,
-  base64-shaped, an environment listing, a code frame, a note or warning, or
-  credential-shaped. Paths into the private tree outside `node_modules/`,
-  `ios/` and `android/` are replaced with `<src>/<app file>`.
+**The wrapper.** `npm ci`, `expo prebuild`, `pod install`, the profile helper,
+Gradle and `xcodebuild` run under `.github/scripts/quiet_run.py`. Their full
+output goes to a mode-600 file in `$RUNNER_TEMP/private-logs/` (mode 700),
+which is never uploaded as an artifact or a cache and is deleted by the scrub
+step. Everything the wrapper prints sits between `::stop-commands::<token>` and
+`::<token>::`, with a random token per invocation, so none of it can act as a
+workflow command.
 
-What the log does still show: the source repository's name, the ref and
-commit SHA built, and that commit's subject line (printed by
-`actions/checkout`); the app's version and build number; the signing
-certificate's name and the profile's name and app id; the expected and actual
-signing fingerprints; and the artifact's file name and sha256. Nothing else
-from the private tree is printed by the harness's own steps.
+**While a tool runs**, a line reaches the log only if it matches an allowlisted
+shape in full: Gradle task names of the `:app` module (other modules' tasks are
+only counted), Gradle's result lines, the `npm ci` "added N packages" line, the
+four expo prebuild progress lines, the two CocoaPods summary lines, the
+xcodebuild `** ARCHIVE SUCCEEDED **`-style result lines, and Metro's
+"Bundled" line for a `node_modules/` entry point. Every run ends with the
+wrapper's own summary: line counts, how many were withheld, and that the full
+output existed only on the runner and was removed.
+
+**When a tool fails**, the log gets the same summary (with the exit status) and
+an error block in which each line is a fixed template, never the tool's own
+text. A tool line that matches none of these shapes, starts with whitespace, or
+is longer than 1,000 characters is withheld:
+
+| Tool line | What the log shows |
+|---|---|
+| `> Task :app:X FAILED`, `Execution failed for task ':app:X'.` | the same, with a library module's name replaced by `<library module>` |
+| `* What went wrong:` and the lines under it | `* What went wrong: <details withheld>` |
+| `FAILURE: Build failed with an exception.`, `BUILD FAILED in …` | the same |
+| a compiler error, `<path>:<line>[:<col>]: error: …` | `error: <L error in K>`, where L is javac, Kotlin, Swift, Clang or compiler, and K: one of an app source file, the generated android project, the generated ios project, a dependency in node_modules, a file outside the source tree |
+| a Kotlin `e: file://<path>…` error | `e: <Kotlin compiler error in K>` |
+| an xcodebuild `<project>.xcodeproj: error: …` | for five signing messages (a profile lacking a capability or an entitlement, or not matching an entitlement; no profiles for an app id; no signing certificate of a type), the message with the target suffix dropped. These name only the profile, capability, entitlement and app id, which come from this repo's own secrets. Any other: `xcodebuild: error: <project error withheld>` |
+| `** ARCHIVE FAILED **` and similar | the same |
+| `The following build commands failed:` and its list | the same heading, `failed build command: <phase>` per entry (for example `CompileSwift`), and `(N failures)` |
+| `npm error code X`, `npm error errno X` | the same (the code is an upper-case identifier, such as `ERESOLVE`, `E401`, `ENOTFOUND`) |
+| `XError: …` or `x.y.ZException: …` | the class, if it is a standard JavaScript error or under `java.`, `javax.`, `kotlin.`, `org.gradle.`, `com.android.` or `groovy.`, followed by `: <message withheld>`. Any other class is `<error class withheld>` |
+| a CocoaPods `[!] …` line | `[!] <CocoaPods error withheld>` |
+| `error: …`, `fatal: …`, `ERROR: …`, `error[X]: …` | `error: <message withheld>` (and so on) |
+
+A template that repeats is printed once with `(xN)`, and the block stops at 40
+lines. The full text is never in the public log: to see it, rerun the build
+privately (on a machine or a private repository you control), not here.
+
+**What a public log can still show from the private tree:**
+
+- the source repository's name, the ref built, the commit SHA, and that
+  commit's subject line (all printed by `actions/checkout`);
+- the Node version pinned in the tree's `.nvmrc` (printed by `actions/setup-node`);
+- the app's version and build number, and on iOS the scheme and workspace name
+  of the generated project (printed by the harness, and in the per-step `env:`
+  listings GitHub shows);
+- the names of Gradle tasks in the `:app` module, and the counts the wrapper
+  prints;
+- on failure, the error templates above: which task or build phase failed, the
+  language and kind of file a compiler error is in, the npm error code, a
+  standard error class, and the exit status.
+
+The log also shows signing details that come from this repo's own secrets and
+variables, not from the tree: the certificate's name, the profile's name, UUID,
+team and app id, the key alias, and the expected and actual signing
+fingerprints and serial. The artifact's file name (built from this repo's name,
+a timestamp and the run number) and its sha256 appear at the end.
+
+**Caches.** No step saves an Actions cache: `actions/setup-node` runs without
+its `cache` input, and `actions/setup-java` and `android-actions/setup-android`
+cache nothing unless asked. npm's own debug log, which names the tree's
+dependencies and paths, is turned off (`npm_config_logs_max=0` for the whole
+job), and the scrub step removes `~/.npm/_logs` as well.
 
 ## The deploy key
 

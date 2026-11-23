@@ -60,6 +60,9 @@ concurrency:
 env:
   SRC: src
   QUIET_RUN: ${{ github.workspace }}/.github/scripts/quiet_run.py
+  # npm writes a debug log of every run (dependency tree, paths) under
+  # ~/.npm/_logs; 0 turns that file off for npm ci and npx alike.
+  npm_config_logs_max: "0"
 
 jobs:
   build:
@@ -134,8 +137,9 @@ jobs:
         with:
           # The app pins its Node version, and its .npmrc makes npm refuse any other.
           node-version-file: ${{ env.SRC }}/.nvmrc
-          cache: npm
-          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+          # No `cache:`. An Actions cache of ~/.npm is restorable by any run in
+          # this public repository, and its index names every dependency of the
+          # private tree. Without the input, setup-node saves no cache at all.
 
       - uses: actions/setup-java@v4
         with:
@@ -295,4 +299,4 @@ jobs:
 
       - name: Scrub credentials from the runner
         if: always()
-        run: rm -rf "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/rclone.conf" "$RUNNER_TEMP/private-logs" || true
+        run: rm -rf "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/rclone.conf" "$RUNNER_TEMP/private-logs" "$HOME/.npm/_logs" || true

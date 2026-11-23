@@ -56,6 +56,9 @@ concurrency:
 env:
   SRC: src
   QUIET_RUN: ${{ github.workspace }}/.github/scripts/quiet_run.py
+  # npm writes a debug log of every run (dependency tree, paths) under
+  # ~/.npm/_logs; 0 turns that file off for npm ci and npx alike.
+  npm_config_logs_max: "0"
   # SDK 56 turns on Expo's precompiled xcframeworks by default, and their
   # from-source fallback for ExpoModulesJSI needs SwiftPM resolution that fails
   # in the archive phase ("Could not resolve package dependencies").
@@ -144,8 +147,9 @@ jobs:
         with:
           # The app pins its Node version, and its .npmrc makes npm refuse any other.
           node-version-file: ${{ env.SRC }}/.nvmrc
-          cache: npm
-          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+          # No `cache:`. An Actions cache of ~/.npm is restorable by any run in
+          # this public repository, and its index names every dependency of the
+          # private tree. Without the input, setup-node saves no cache at all.
 
       - name: Select the newest Xcode and report Swift
         # Pick the highest installed version explicitly and print the Swift
@@ -376,4 +380,4 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP/dist-cert.p12" "$RUNNER_TEMP/profile.mobileprovision" \
                 "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/rclone.conf" || true
-          rm -rf "$RUNNER_TEMP/private-logs" || true
+          rm -rf "$RUNNER_TEMP/private-logs" "$HOME/.npm/_logs" || true
